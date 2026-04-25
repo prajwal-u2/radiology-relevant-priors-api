@@ -23,6 +23,8 @@ app = FastAPI(title="Relevant Priors API", version="1.0")
 # OpenAI client
 client = OpenAI()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+USE_LLM_FALLBACK = os.getenv("USE_LLM_FALLBACK", "true").lower() == "true"
+LLM_TIME_BUDGET_SEC = float(os.getenv("LLM_TIME_BUDGET_SEC", "240"))
 
 # in-memory cache
 _cache: dict[tuple[str, str], bool] = {}
@@ -106,34 +108,70 @@ Rules:
 - Completely different body parts = NOT relevant
 - Modality alone does NOT determine relevance
 
-Respond ONLY with a JSON array in the same order as the priors given.
-Each entry: {"study_id": "...", "relevant": true|false}
+Respond ONLY with strict JSON object:
+{"results":[{"study_id":"...","relevant":true}]}
+Keep same order as the priors given.
 No markdown, no explanation."""
 
 
-def _llm_batch_predict(current_desc: str, current_date: str, priors: list[dict]) -> dict[str, bool]:
+def _parse_llm_results(raw: str) -> list[dict]:
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    data = json.loads(cleaned)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"]
+    raise ValueError("Unexpected JSON shape")
+
+
+def _llm_call_once(current_desc: str, current_date: str, priors: list[dict]) -> list[dict]:
     prior_lines = "\n".join(
         f'{i+1}. study_id={p["study_id"]} | date={p.get("study_date","")} | "{p["study_description"]}"'
         for i, p in enumerate(priors)
     )
     user_msg = f'Current (date={current_date}): "{current_desc}"\n\nPriors:\n{prior_lines}'
-    try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": LLM_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0,
-            max_tokens=1000,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        results = json.loads(raw)
-        return {str(r["study_id"]): bool(r["relevant"]) for r in results}
-    except Exception as e:
-        log.error("LLM batch failed: %s", e)
-        return {str(p["study_id"]): False for p in priors}
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": LLM_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=1200,
+        timeout=25,
+    )
+    raw = response.choices[0].message.content or ""
+    return _parse_llm_results(raw)
+
+
+def _llm_batch_predict(current_desc: str, current_date: str, priors: list[dict]) -> dict[str, bool]:
+    results_by_id: dict[str, bool] = {}
+    chunk_size = 20
+    for i in range(0, len(priors), chunk_size):
+        chunk = priors[i:i + chunk_size]
+        try:
+            rows = _llm_call_once(current_desc, current_date, chunk)
+        except Exception as e:
+            log.warning("LLM parse failed, retrying once: %s", e)
+            try:
+                rows = _llm_call_once(current_desc, current_date, chunk)
+            except Exception as e2:
+                log.error("LLM chunk failed after retry: %s", e2)
+                rows = []
+
+        for r in rows:
+            sid = str(r.get("study_id", "")).strip()
+            if sid:
+                results_by_id[sid] = bool(r.get("relevant", False))
+
+        # guarantee a value for every prior in the chunk
+        for p in chunk:
+            sid = str(p["study_id"])
+            if sid not in results_by_id:
+                results_by_id[sid] = False
+
+    return results_by_id
 
 
 # request/response models
@@ -204,7 +242,15 @@ async def predict(req: PredictRequest):
             ))
 
         # re-check ambiguous priors in one LLM call per case
-        if ambiguous_priors:
+        if ambiguous_priors and USE_LLM_FALLBACK:
+            if (time.time() - t0) > LLM_TIME_BUDGET_SEC:
+                log.warning(
+                    "LLM skipped | case=%s reason=time_budget elapsed=%.2fs budget=%.2fs",
+                    case.case_id,
+                    time.time() - t0,
+                    LLM_TIME_BUDGET_SEC,
+                )
+                continue
             log.info("LLM | case=%s ambiguous=%d current='%s'",
                      case.case_id, len(ambiguous_priors), cur.study_description)
             llm_results = _llm_batch_predict(
